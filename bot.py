@@ -13,26 +13,72 @@ from telegram.ext import (
     ContextTypes
 )
 
-# === NOVA IMPORTAÇÃO ===
+# === Módulo javascript-obfuscator (você já subiu) ===
 try:
-    from deobfuscator_jsobf import is_js_obfuscator, deobfuscate_js_obfuscator
-    HAS_JS_OBF = True
+    from deobfuscator_jsobf import is_js_obfuscator as _module_is_js_obf
+    from deobfuscator_jsobf import deobfuscate_js_obfuscator
+    HAS_JS_OBF_MODULE = True
 except ImportError:
-    HAS_JS_OBF = False
-    def is_js_obfuscator(code: str) -> bool:
-        return False
+    HAS_JS_OBF_MODULE = False
     def deobfuscate_js_obfuscator(code: str) -> str:
         raise RuntimeError("Módulo deobfuscator_jsobf não encontrado")
 
 TOKEN = os.environ.get("TOKEN")
 
-# Caminho do script Node (deve ficar na mesma pasta do bot.py)
 NODE_SCRIPT = os.path.join(os.path.dirname(__file__), "deobfuscate.js")
 
-# Limites pensados para hospedagem free (Railway) com recursos limitados
-MAX_INPUT_SIZE = 2_000_000       # ~2MB de texto antes de tentar processar
-NODE_TIMEOUT_SECONDS = 8         # mata o processo Node se passar disso
+MAX_INPUT_SIZE = 2_000_000
+NODE_TIMEOUT_SECONDS = 8
 
+
+# =====================================================================
+# Detecção melhorada de javascript-obfuscator (funciona dentro de HTML)
+# =====================================================================
+
+def is_js_obfuscator(code: str) -> bool:
+    """Detecta javascript-obfuscator mesmo quando está dentro de HTML."""
+    if not code or len(code) < 2000:
+        return False
+
+    # Se o módulo externo tiver uma detecção própria, usa ela também
+    if HAS_JS_OBF_MODULE:
+        try:
+            if _module_is_js_obf(code):
+                return True
+        except Exception:
+            pass
+
+    scripts = re.findall(r'<script[^>]*>(.*?)</script>', code, re.DOTALL | re.I)
+    target = max(scripts, key=len) if scripts else code
+
+    count_0x = len(re.findall(r'_0x[a-fA-F0-9]{4,}', target))
+    has_function_0x = bool(re.search(r'function\s*\(\s*_0x[a-fA-F0-9]+', target))
+    has_return_0x = bool(re.search(r'return\s+_0x[a-fA-F0-9]+\(', target))
+    has_array_shuffle = bool(re.search(r'for\s*\(\s*(?:var|let|const)?\s*_0x[a-fA-F0-9]+\s*=', target))
+    has_string_array = bool(re.search(r'(?:var|let|const)\s+_0x[a-fA-F0-9]+\s*=\s*\[', target))
+
+    score = 0
+    if count_0x > 80:       score += 3
+    if count_0x > 300:      score += 2
+    if has_function_0x:     score += 2
+    if has_return_0x:       score += 1
+    if has_array_shuffle:   score += 2
+    if has_string_array:    score += 1
+
+    return score >= 5
+
+
+def extract_js_from_html(code: str) -> str:
+    """Extrai o maior bloco <script> do HTML."""
+    scripts = re.findall(r'<script[^>]*>(.*?)</script>', code, re.DOTALL | re.I)
+    if not scripts:
+        return code
+    return max(scripts, key=len).strip()
+
+
+# =====================================================================
+# Funções antigas (unescape / base64 / phpkobo)
+# =====================================================================
 
 def js_unescape(s: str) -> str:
     s = re.sub(
@@ -66,11 +112,6 @@ def node_available() -> bool:
 
 
 def try_phpkobo_sandbox(raw: str) -> tuple[str | None, str]:
-    """
-    Executa o loader phpkobo dentro de uma sandbox Node (módulo `vm`),
-    interceptando Function()/eval() para capturar o payload final SEM
-    executá-lo de verdade. Requer Node.js disponível no ambiente.
-    """
     if not node_available():
         return None, ""
 
@@ -113,7 +154,6 @@ def try_phpkobo_sandbox(raw: str) -> tuple[str | None, str]:
 
 
 def try_phpkobo_regex(raw: str) -> tuple[str | None, str]:
-    """Fallback: extração simples por regex (não executa nada, só remove a casca)."""
     is_phpkobo = (
         "phpkobo.com" in raw.lower()
         or "html-obfuscator" in raw.lower()
@@ -167,32 +207,36 @@ def try_phpkobo_regex(raw: str) -> tuple[str | None, str]:
     return header + inner, "phpkobo (extração experimental / regex)"
 
 
+# =====================================================================
+# Função principal de desofuscação
+# =====================================================================
+
 def extract_and_decode(raw: str) -> tuple[str | None, str, str]:
     """
-    Retorna (resultado, método_usado, extensão_sugerida)
-    extensão_sugerida: "html" ou "js"
+    Retorna (resultado, método_usado, extensão)
+    extensão: "js" ou "html"
     """
 
-    # ============================================================
+    # ---------------------------------------------------------------
     # 1) JAVASCRIPT-OBFUSCATOR (prioridade alta)
-    # ============================================================
-    if HAS_JS_OBF and is_js_obfuscator(raw):
+    # ---------------------------------------------------------------
+    if is_js_obfuscator(raw):
         try:
-            result = deobfuscate_js_obfuscator(raw)
-            if result and len(result.strip()) > 50:
+            pure_js = extract_js_from_html(raw)
+            result = deobfuscate_js_obfuscator(pure_js)
+            if result and len(result.strip()) > 100:
                 header = (
                     "/* ============================================================\n"
                     "   DESOFUSCAÇÃO: javascript-obfuscator\n"
                     "   ============================================================ */\n\n"
                 )
                 return header + result, "javascript-obfuscator", "js"
-        except Exception as e:
-            # Se falhar, continua tentando os outros métodos
-            pass
+        except Exception:
+            pass  # continua para os outros métodos
 
-    # ============================================================
+    # ---------------------------------------------------------------
     # 2) phpkobo / Function packing
-    # ============================================================
+    # ---------------------------------------------------------------
     is_phpkobo_like = (
         "phpkobo.com" in raw.lower()
         or "html-obfuscator" in raw.lower()
@@ -208,9 +252,9 @@ def extract_and_decode(raw: str) -> tuple[str | None, str, str]:
         if result:
             return result, method, "html"
 
-    # ============================================================
+    # ---------------------------------------------------------------
     # 3) unescape() / percent-encoding
-    # ============================================================
+    # ---------------------------------------------------------------
     idx = raw.find("unescape(")
     if idx != -1:
         rest = raw[idx + 9:].lstrip()
@@ -223,9 +267,9 @@ def extract_and_decode(raw: str) -> tuple[str | None, str, str]:
                 except Exception:
                     pass
 
-    # ============================================================
+    # ---------------------------------------------------------------
     # 4) atob() / base64
-    # ============================================================
+    # ---------------------------------------------------------------
     idx = raw.find("atob(")
     if idx != -1:
         rest = raw[idx + 5:].lstrip()
@@ -237,9 +281,9 @@ def extract_and_decode(raw: str) -> tuple[str | None, str, str]:
                 if res:
                     return res, "atob() / base64", "html"
 
-    # ============================================================
-    # 5) Detecção automática (sem função explícita)
-    # ============================================================
+    # ---------------------------------------------------------------
+    # 5) Detecção automática
+    # ---------------------------------------------------------------
     payload = raw.strip().strip("'\"")
 
     if re.search(r"%[0-9a-fA-F]{2}|%u[0-9a-fA-F]{4}", payload[:5000], re.I):
@@ -256,9 +300,13 @@ def extract_and_decode(raw: str) -> tuple[str | None, str, str]:
     return None, "", "html"
 
 
+# =====================================================================
+# Handlers do Telegram
+# =====================================================================
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     node_status = "✅ disponível" if node_available() else "⚠️ indisponível (usando fallback regex)"
-    js_obf_status = "✅ disponível" if HAS_JS_OBF else "⚠️ módulo não encontrado"
+    js_obf_status = "✅ disponível" if HAS_JS_OBF_MODULE else "⚠️ módulo não encontrado"
 
     await update.message.reply_text(
         "🔓 *Desofuscador de HTML / JS*\n\n"
@@ -276,9 +324,11 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def _process_and_reply(update: Update, msg, raw: str):
-    # Aviso especial para javascript-obfuscator (pode demorar)
-    if HAS_JS_OBF and is_js_obfuscator(raw):
-        await msg.edit_text("🔍 Detectado padrão **javascript-obfuscator**...\nProcessando (pode levar alguns segundos)...")
+    if is_js_obfuscator(raw):
+        await msg.edit_text(
+            "🔍 Detectado padrão **javascript-obfuscator**...\n"
+            "Processando (pode levar alguns segundos)..."
+        )
 
     result, method, extension = extract_and_decode(raw)
 
@@ -290,7 +340,10 @@ async def _process_and_reply(update: Update, msg, raw: str):
         )
         return
 
-    await msg.edit_text(f"✅ Decodificado com sucesso!\nMétodo: *{method}*", parse_mode="Markdown")
+    await msg.edit_text(
+        f"✅ Decodificado com sucesso!\nMétodo: *{method}*",
+        parse_mode="Markdown"
+    )
 
     try:
         clean = result.encode('utf-8', errors='replace').decode('utf-8')
@@ -356,7 +409,7 @@ def main():
     app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
 
     print("🤖 Bot desofuscador rodando...")
-    print(f"   JS-Obfuscator: {'✅' if HAS_JS_OBF else '❌ módulo não encontrado'}")
+    print(f"   JS-Obfuscator: {'✅' if HAS_JS_OBF_MODULE else '❌ módulo não encontrado'}")
     print(f"   Node sandbox:  {'✅' if node_available() else '❌'}")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
