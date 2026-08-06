@@ -13,6 +13,17 @@ from telegram.ext import (
     ContextTypes
 )
 
+# === NOVA IMPORTAÇÃO ===
+try:
+    from deobfuscator_jsobf import is_js_obfuscator, deobfuscate_js_obfuscator
+    HAS_JS_OBF = True
+except ImportError:
+    HAS_JS_OBF = False
+    def is_js_obfuscator(code: str) -> bool:
+        return False
+    def deobfuscate_js_obfuscator(code: str) -> str:
+        raise RuntimeError("Módulo deobfuscator_jsobf não encontrado")
+
 TOKEN = os.environ.get("TOKEN")
 
 # Caminho do script Node (deve ficar na mesma pasta do bot.py)
@@ -87,8 +98,6 @@ def try_phpkobo_sandbox(raw: str) -> tuple[str | None, str]:
     except Exception:
         return None, ""
 
-    # Pega o maior payload capturado (geralmente é o código real, não o
-    # erro de anti-debug nem logs curtos)
     candidates = [c["value"] for c in captured if c["type"] in ("Function()", "eval()")]
     if not candidates:
         return None, ""
@@ -158,9 +167,32 @@ def try_phpkobo_regex(raw: str) -> tuple[str | None, str]:
     return header + inner, "phpkobo (extração experimental / regex)"
 
 
-def extract_and_decode(raw: str) -> tuple[str | None, str]:
-    """Retorna (resultado, método_usado)"""
+def extract_and_decode(raw: str) -> tuple[str | None, str, str]:
+    """
+    Retorna (resultado, método_usado, extensão_sugerida)
+    extensão_sugerida: "html" ou "js"
+    """
 
+    # ============================================================
+    # 1) JAVASCRIPT-OBFUSCATOR (prioridade alta)
+    # ============================================================
+    if HAS_JS_OBF and is_js_obfuscator(raw):
+        try:
+            result = deobfuscate_js_obfuscator(raw)
+            if result and len(result.strip()) > 50:
+                header = (
+                    "/* ============================================================\n"
+                    "   DESOFUSCAÇÃO: javascript-obfuscator\n"
+                    "   ============================================================ */\n\n"
+                )
+                return header + result, "javascript-obfuscator", "js"
+        except Exception as e:
+            # Se falhar, continua tentando os outros métodos
+            pass
+
+    # ============================================================
+    # 2) phpkobo / Function packing
+    # ============================================================
     is_phpkobo_like = (
         "phpkobo.com" in raw.lower()
         or "html-obfuscator" in raw.lower()
@@ -168,15 +200,17 @@ def extract_and_decode(raw: str) -> tuple[str | None, str]:
     )
 
     if is_phpkobo_like:
-        # 1) tenta a sandbox Node primeiro (mais confiável)
         result, method = try_phpkobo_sandbox(raw)
         if result:
-            return result, method
-        # 2) cai pro regex se Node não estiver disponível ou falhar
+            return result, method, "html"
+
         result, method = try_phpkobo_regex(raw)
         if result:
-            return result, method
+            return result, method, "html"
 
+    # ============================================================
+    # 3) unescape() / percent-encoding
+    # ============================================================
     idx = raw.find("unescape(")
     if idx != -1:
         rest = raw[idx + 9:].lstrip()
@@ -185,10 +219,13 @@ def extract_and_decode(raw: str) -> tuple[str | None, str]:
             end = rest.find(quote, 1)
             if end != -1:
                 try:
-                    return js_unescape(rest[1:end]), "unescape() / percent-encoding"
+                    return js_unescape(rest[1:end]), "unescape() / percent-encoding", "html"
                 except Exception:
                     pass
 
+    # ============================================================
+    # 4) atob() / base64
+    # ============================================================
     idx = raw.find("atob(")
     if idx != -1:
         rest = raw[idx + 5:].lstrip()
@@ -198,46 +235,58 @@ def extract_and_decode(raw: str) -> tuple[str | None, str]:
             if end != -1:
                 res = try_base64(rest[1:end])
                 if res:
-                    return res, "atob() / base64"
+                    return res, "atob() / base64", "html"
 
+    # ============================================================
+    # 5) Detecção automática (sem função explícita)
+    # ============================================================
     payload = raw.strip().strip("'\"")
 
     if re.search(r"%[0-9a-fA-F]{2}|%u[0-9a-fA-F]{4}", payload[:5000], re.I):
         try:
-            return js_unescape(payload), "unescape() / percent-encoding (auto)"
+            return js_unescape(payload), "unescape() / percent-encoding (auto)", "html"
         except Exception:
             pass
 
     if len(payload) < 200000:
         res = try_base64(payload)
         if res:
-            return res, "atob() / base64 (auto)"
+            return res, "atob() / base64 (auto)", "html"
 
-    return None, ""
+    return None, "", "html"
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     node_status = "✅ disponível" if node_available() else "⚠️ indisponível (usando fallback regex)"
+    js_obf_status = "✅ disponível" if HAS_JS_OBF else "⚠️ módulo não encontrado"
+
     await update.message.reply_text(
-        "🔓 *Desofuscador de HTML*\n\n"
-        "Envie o código ofuscado como *texto* ou como *arquivo* (.txt / .html)\n\n"
+        "🔓 *Desofuscador de HTML / JS*\n\n"
+        "Envie o código ofuscado como *texto* ou como *arquivo* (.txt / .html / .js)\n\n"
         "Formatos suportados:\n"
         "• `unescape()` / percent-encoding\n"
         "• `atob()` / base64\n"
-        "• phpkobo (sandbox Node ou regex)\n\n"
-        f"Sandbox Node: {node_status}\n\n"
-        "Eu devolvo o código + o arquivo `.html` pronto para download.",
+        "• phpkobo (sandbox Node ou regex)\n"
+        "• **javascript-obfuscator**\n\n"
+        f"Sandbox Node: {node_status}\n"
+        f"JS-Obfuscator: {js_obf_status}\n\n"
+        "Eu devolvo o código + o arquivo pronto para download.",
         parse_mode="Markdown"
     )
 
 
 async def _process_and_reply(update: Update, msg, raw: str):
-    result, method = extract_and_decode(raw)
+    # Aviso especial para javascript-obfuscator (pode demorar)
+    if HAS_JS_OBF and is_js_obfuscator(raw):
+        await msg.edit_text("🔍 Detectado padrão **javascript-obfuscator**...\nProcessando (pode levar alguns segundos)...")
+
+    result, method, extension = extract_and_decode(raw)
 
     if not result:
         await msg.edit_text(
             "❌ Não consegui identificar/desofuscar o formato.\n\n"
-            "Cole o script completo com `unescape(...)`, `atob(...)` ou phpkobo."
+            "Cole o script completo com `unescape(...)`, `atob(...)`, "
+            "phpkobo ou javascript-obfuscator."
         )
         return
 
@@ -247,9 +296,11 @@ async def _process_and_reply(update: Update, msg, raw: str):
         clean = result.encode('utf-8', errors='replace').decode('utf-8')
         bio = BytesIO(clean.encode('utf-8'))
         bio.seek(0)
+
+        filename = f"decodificado.{extension}"
         await update.message.reply_document(
             document=bio,
-            filename="decodificado.html",
+            filename=filename,
             caption=f"✅ Arquivo pronto!\nMétodo usado: {method}"
         )
     except Exception as e:
@@ -263,7 +314,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if len(raw) > MAX_INPUT_SIZE:
-        await update.message.reply_text("❌ Texto muito grande. Envie como arquivo (.txt/.html).")
+        await update.message.reply_text("❌ Texto muito grande. Envie como arquivo (.txt/.html/.js).")
         return
 
     msg = await update.message.reply_text("⏳ Desofuscando...")
@@ -305,6 +356,8 @@ def main():
     app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
 
     print("🤖 Bot desofuscador rodando...")
+    print(f"   JS-Obfuscator: {'✅' if HAS_JS_OBF else '❌ módulo não encontrado'}")
+    print(f"   Node sandbox:  {'✅' if node_available() else '❌'}")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
