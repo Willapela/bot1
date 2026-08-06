@@ -13,7 +13,7 @@ from telegram.ext import (
     ContextTypes
 )
 
-# === Módulo javascript-obfuscator (você já subiu) ===
+# === Módulo javascript-obfuscator ===
 try:
     from deobfuscator_jsobf import is_js_obfuscator as _module_is_js_obf
     from deobfuscator_jsobf import deobfuscate_js_obfuscator
@@ -40,7 +40,6 @@ def is_js_obfuscator(code: str) -> bool:
     if not code or len(code) < 2000:
         return False
 
-    # Se o módulo externo tiver uma detecção própria, usa ela também
     if HAS_JS_OBF_MODULE:
         try:
             if _module_is_js_obf(code):
@@ -214,24 +213,12 @@ def try_phpkobo_regex(raw: str) -> tuple[str | None, str]:
 def extract_and_decode(raw: str) -> tuple[str | None, str, str]:
     """
     Retorna (resultado, método_usado, extensão)
-    extensão: "js" ou "html"
     """
 
-    # ---------------------------------------------------------------
     # 1) JAVASCRIPT-OBFUSCATOR (prioridade alta)
-    # ---------------------------------------------------------------
-def extract_and_decode(raw: str) -> tuple[str | None, str, str]:
-    """
-    Retorna (resultado, método_usado, extensão)
-    """
-
-    # ---------------------------------------------------------------
-    # 1) JAVASCRIPT-OBFUSCATOR (prioridade alta)
-    # ---------------------------------------------------------------
     if is_js_obfuscator(raw):
         pure_js = extract_js_from_html(raw)
 
-        # Tenta desofuscar com o módulo
         try:
             result = deobfuscate_js_obfuscator(pure_js)
             if result and len(result.strip()) > 100:
@@ -242,7 +229,6 @@ def extract_and_decode(raw: str) -> tuple[str | None, str, str]:
                 )
                 return header + result, "javascript-obfuscator", "js"
         except Exception as e:
-            # Se o módulo falhar, ainda devolve o JS puro extraído
             header = (
                 "/* ============================================================\n"
                 "   JAVASCRIPT-OBFUSCATOR DETECTADO\n"
@@ -252,7 +238,7 @@ def extract_and_decode(raw: str) -> tuple[str | None, str, str]:
             )
             return header + pure_js, "javascript-obfuscator (extraído, ainda ofuscado)", "js"
 
-        # Se chegou aqui é porque o módulo retornou vazio → devolve o puro mesmo
+        # Módulo retornou vazio → devolve o puro
         header = (
             "/* ============================================================\n"
             "   JAVASCRIPT-OBFUSCATOR DETECTADO\n"
@@ -261,9 +247,7 @@ def extract_and_decode(raw: str) -> tuple[str | None, str, str]:
         )
         return header + pure_js, "javascript-obfuscator (extraído, ainda ofuscado)", "js"
 
-    # ---------------------------------------------------------------
     # 2) phpkobo / Function packing
-    # ---------------------------------------------------------------
     is_phpkobo_like = (
         "phpkobo.com" in raw.lower()
         or "html-obfuscator" in raw.lower()
@@ -279,9 +263,7 @@ def extract_and_decode(raw: str) -> tuple[str | None, str, str]:
         if result:
             return result, method, "html"
 
-    # ---------------------------------------------------------------
     # 3) unescape() / percent-encoding
-    # ---------------------------------------------------------------
     idx = raw.find("unescape(")
     if idx != -1:
         rest = raw[idx + 9:].lstrip()
@@ -294,9 +276,7 @@ def extract_and_decode(raw: str) -> tuple[str | None, str, str]:
                 except Exception:
                     pass
 
-    # ---------------------------------------------------------------
     # 4) atob() / base64
-    # ---------------------------------------------------------------
     idx = raw.find("atob(")
     if idx != -1:
         rest = raw[idx + 5:].lstrip()
@@ -308,9 +288,7 @@ def extract_and_decode(raw: str) -> tuple[str | None, str, str]:
                 if res:
                     return res, "atob() / base64", "html"
 
-    # ---------------------------------------------------------------
     # 5) Detecção automática
-    # ---------------------------------------------------------------
     payload = raw.strip().strip("'\"")
 
     if re.search(r"%[0-9a-fA-F]{2}|%u[0-9a-fA-F]{4}", payload[:5000], re.I):
