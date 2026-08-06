@@ -116,35 +116,58 @@ def try_phpkobo(raw: str) -> tuple[str | None, str]:
 
 def extract_and_decode(raw: str) -> tuple[str | None, str]:
     """Retorna (resultado, método_usado)"""
-    # 1. unescape('...') ou unescape("...")
-    m = re.search(r"unescape\(\s*(['\"])(.*?)\1\s*\)", raw, re.DOTALL)
-    if m:
-        try:
-            return js_unescape(m.group(2)), "unescape() / percent-encoding"
-        except Exception:
-            pass
 
-    # 2. atob('...') ou atob("...")
-    m = re.search(r"atob\(\s*(['\"])(.*?)\1\s*\)", raw, re.DOTALL)
-    if m:
-        res = try_base64(m.group(2))
-        if res:
-            return res, "atob() / base64"
+    # 0. phpkobo / Function packing PRIMEIRO
+    # (arquivos grandes travam nos regex de unescape/atob se ficarem por último)
+    if (
+        "phpkobo.com" in raw.lower()
+        or "html-obfuscator" in raw.lower()
+        or ("Function(" in raw and len(raw) > 8000)
+    ):
+        result, method = try_phpkobo(raw)
+        if result:
+            return result, method
+
+    # 1. unescape — versão rápida (sem regex pesado)
+    idx = raw.find("unescape(")
+    if idx != -1:
+        rest = raw[idx + 9:].lstrip()
+        if rest and rest[0] in ("'", '"'):
+            quote = rest[0]
+            end = rest.find(quote, 1)
+            if end != -1:
+                try:
+                    return js_unescape(rest[1:end]), "unescape() / percent-encoding"
+                except Exception:
+                    pass
+
+    # 2. atob — versão rápida
+    idx = raw.find("atob(")
+    if idx != -1:
+        rest = raw[idx + 5:].lstrip()
+        if rest and rest[0] in ("'", '"'):
+            quote = rest[0]
+            end = rest.find(quote, 1)
+            if end != -1:
+                res = try_base64(rest[1:end])
+                if res:
+                    return res, "atob() / base64"
 
     # 3. Tenta como string bruta (percent / base64)
     payload = raw.strip().strip("'\"")
 
-    if re.search(r"%[0-9a-fA-F]{2}|%u[0-9a-fA-F]{4}", payload, re.I):
+    if re.search(r"%[0-9a-fA-F]{2}|%u[0-9a-fA-F]{4}", payload[:5000], re.I):
         try:
             return js_unescape(payload), "unescape() / percent-encoding (auto)"
         except Exception:
             pass
 
-    res = try_base64(payload)
-    if res:
-        return res, "atob() / base64 (auto)"
+    if len(payload) < 200000:
+        res = try_base64(payload)
+        if res:
+            return res, "atob() / base64 (auto)"
 
-    # 4. Experimental: phpkobo / Function packing
+    # 4. Última tentativa phpkobo
     result, method = try_phpkobo(raw)
     if result:
         return result, method
