@@ -220,9 +220,19 @@ def extract_and_decode(raw: str) -> tuple[str | None, str, str]:
     # ---------------------------------------------------------------
     # 1) JAVASCRIPT-OBFUSCATOR (prioridade alta)
     # ---------------------------------------------------------------
+def extract_and_decode(raw: str) -> tuple[str | None, str, str]:
+    """
+    Retorna (resultado, método_usado, extensão)
+    """
+
+    # ---------------------------------------------------------------
+    # 1) JAVASCRIPT-OBFUSCATOR (prioridade alta)
+    # ---------------------------------------------------------------
     if is_js_obfuscator(raw):
+        pure_js = extract_js_from_html(raw)
+
+        # Tenta desofuscar com o módulo
         try:
-            pure_js = extract_js_from_html(raw)
             result = deobfuscate_js_obfuscator(pure_js)
             if result and len(result.strip()) > 100:
                 header = (
@@ -231,8 +241,25 @@ def extract_and_decode(raw: str) -> tuple[str | None, str, str]:
                     "   ============================================================ */\n\n"
                 )
                 return header + result, "javascript-obfuscator", "js"
-        except Exception:
-            pass  # continua para os outros métodos
+        except Exception as e:
+            # Se o módulo falhar, ainda devolve o JS puro extraído
+            header = (
+                "/* ============================================================\n"
+                "   JAVASCRIPT-OBFUSCATOR DETECTADO\n"
+                f"   O módulo de desofuscação falhou: {type(e).__name__}: {e}\n"
+                "   Segue o JavaScript puro extraído do HTML (ainda ofuscado).\n"
+                "   ============================================================ */\n\n"
+            )
+            return header + pure_js, "javascript-obfuscator (extraído, ainda ofuscado)", "js"
+
+        # Se chegou aqui é porque o módulo retornou vazio → devolve o puro mesmo
+        header = (
+            "/* ============================================================\n"
+            "   JAVASCRIPT-OBFUSCATOR DETECTADO\n"
+            "   Módulo não retornou resultado. Segue o JS puro extraído.\n"
+            "   ============================================================ */\n\n"
+        )
+        return header + pure_js, "javascript-obfuscator (extraído, ainda ofuscado)", "js"
 
     # ---------------------------------------------------------------
     # 2) phpkobo / Function packing
