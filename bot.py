@@ -105,7 +105,9 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # Envia o arquivo .html
     try:
-        bio = BytesIO(result.encode('utf-8'))
+        # Trata surrogates e caracteres inválidos (erro utf-8)
+        clean = result.encode('utf-8', errors='replace').decode('utf-8')
+        bio = BytesIO(clean.encode('utf-8'))
         bio.seek(0)
         await update.message.reply_document(
             document=bio,
@@ -146,7 +148,9 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # Envia o arquivo .html
     try:
-        bio = BytesIO(result.encode('utf-8'))
+        # Trata surrogates e caracteres inválidos (erro utf-8)
+        clean = result.encode('utf-8', errors='replace').decode('utf-8')
+        bio = BytesIO(clean.encode('utf-8'))
         bio.seek(0)
         await update.message.reply_document(
             document=bio,
