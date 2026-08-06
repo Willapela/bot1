@@ -1,5 +1,8 @@
 import os
 import re
+import json
+import shutil
+import subprocess
 from io import BytesIO
 from telegram import Update
 from telegram.ext import (
@@ -12,16 +15,21 @@ from telegram.ext import (
 
 TOKEN = os.environ.get("TOKEN")
 
+# Caminho do script Node (deve ficar na mesma pasta do bot.py)
+NODE_SCRIPT = os.path.join(os.path.dirname(__file__), "deobfuscate.js")
+
+# Limites pensados para hospedagem free (Railway) com recursos limitados
+MAX_INPUT_SIZE = 2_000_000       # ~2MB de texto antes de tentar processar
+NODE_TIMEOUT_SECONDS = 8         # mata o processo Node se passar disso
+
+
 def js_unescape(s: str) -> str:
-    """Versão Python do unescape() clássico (mais tolerante)"""
-    # %uXXXX (unicode)
     s = re.sub(
         r'%u([0-9a-fA-F]{4})',
         lambda m: chr(int(m.group(1), 16)),
         s,
         flags=re.I
     )
-    # %XX (bytes)
     s = re.sub(
         r'%([0-9a-fA-F]{2})',
         lambda m: chr(int(m.group(1), 16)),
@@ -42,93 +50,133 @@ def try_base64(s: str) -> str | None:
         return None
 
 
-def try_phpkobo(raw: str) -> tuple[str | None, str]:
+def node_available() -> bool:
+    return shutil.which("node") is not None and os.path.exists(NODE_SCRIPT)
+
+
+def try_phpkobo_sandbox(raw: str) -> tuple[str | None, str]:
     """
-    Extração experimental do tipo phpkobo.com/html-obfuscator.
-    Remove a casca do Function("...") e devolve o código interno.
-    Não executa o JS — só extrai o conteúdo.
+    Executa o loader phpkobo dentro de uma sandbox Node (módulo `vm`),
+    interceptando Function()/eval() para capturar o payload final SEM
+    executá-lo de verdade. Requer Node.js disponível no ambiente.
     """
-    # Detecta o comentário ou a estrutura típica
+    if not node_available():
+        return None, ""
+
+    if len(raw) > MAX_INPUT_SIZE:
+        return None, "arquivo excede o limite de processamento seguro"
+
+    try:
+        proc = subprocess.run(
+            ["node", NODE_SCRIPT],
+            input=raw,
+            capture_output=True,
+            text=True,
+            timeout=NODE_TIMEOUT_SECONDS,
+        )
+    except subprocess.TimeoutExpired:
+        return None, "timeout ao executar sandbox (arquivo muito complexo)"
+    except Exception as e:
+        return None, f"erro ao chamar sandbox: {e}"
+
+    if proc.returncode != 0 or not proc.stdout:
+        return None, ""
+
+    try:
+        captured = json.loads(proc.stdout)
+    except Exception:
+        return None, ""
+
+    # Pega o maior payload capturado (geralmente é o código real, não o
+    # erro de anti-debug nem logs curtos)
+    candidates = [c["value"] for c in captured if c["type"] in ("Function()", "eval()")]
+    if not candidates:
+        return None, ""
+
+    best = max(candidates, key=len)
+    header = (
+        "/* ============================================================\n"
+        "   DESOFUSCAÇÃO VIA SANDBOX (Node vm, Function/eval interceptados)\n"
+        "   O código abaixo foi capturado antes de ser executado de fato.\n"
+        "   ============================================================ */\n\n"
+    )
+    return header + best, "phpkobo (sandbox Node)"
+
+
+def try_phpkobo_regex(raw: str) -> tuple[str | None, str]:
+    """Fallback: extração simples por regex (não executa nada, só remove a casca)."""
     is_phpkobo = (
         "phpkobo.com" in raw.lower()
         or "html-obfuscator" in raw.lower()
         or (raw.strip().startswith((";Function(", "Function(")) and len(raw) > 5000)
     )
-
     if not is_phpkobo:
-        # Também tenta achar Function("...") mesmo sem o comentário
         if "Function(" not in raw or len(raw) < 3000:
             return None, ""
 
-    # Remove tags HTML e comentários
     js = re.sub(r"<!--.*?-->", "", raw, flags=re.DOTALL)
     js = re.sub(r"<!DOCTYPE[^>]*>", "", js, flags=re.I)
     js = re.sub(r"<meta[^>]*>", "", js, flags=re.I)
     js = re.sub(r"</?script[^>]*>", "", js, flags=re.I)
     js = js.strip()
 
-    # Tenta extrair o argumento de Function("...") ou Function('...')
-    # O argumento costuma ser muito grande e terminar com ")();"
-    m = re.search(
-        r"""Function\s*\(\s*(['"])(.*?)\1\s*\)\s*\(\s*\)""",
-        js,
-        re.DOTALL,
-    )
-    if m:
-        inner = m.group(2)
-        # Desescapa sequências comuns
-        try:
-            inner = (
-                inner.replace("\\\\", "\\")
-                .replace("\\n", "\n")
-                .replace("\\r", "\r")
-                .replace("\\t", "\t")
-                .replace("\\'", "'")
-                .replace('\\"', '"')
-            )
-        except Exception:
-            pass
+    m = re.search(r"""Function\s*\(\s*(['"])(.*?)\1\s*\)\s*\(\s*\)""", js, re.DOTALL)
+    if not m:
+        return None, ""
 
-        # Decodifica \xNN e \uNNNN se existirem
-        def decode_escapes(s):
-            def repl_x(mo):
-                try:
-                    return chr(int(mo.group(1), 16))
-                except Exception:
-                    return mo.group(0)
-            s = re.sub(r"\\x([0-9a-fA-F]{2})", repl_x, s)
-            s = re.sub(r"\\u([0-9a-fA-F]{4})", repl_x, s)
-            return s
-
-        inner = decode_escapes(inner)
-
-        header = (
-            "/* ============================================================\n"
-            "   EXTRAÇÃO EXPERIMENTAL (phpkobo / Function packing)\n"
-            "   O código abaixo ainda pode estar parcialmente ofuscado.\n"
-            "   Não é uma desofuscação completa — apenas remove a casca.\n"
-            "   ============================================================ */\n\n"
+    inner = m.group(2)
+    try:
+        inner = (
+            inner.replace("\\\\", "\\")
+            .replace("\\n", "\n")
+            .replace("\\r", "\r")
+            .replace("\\t", "\t")
+            .replace("\\'", "'")
+            .replace('\\"', '"')
         )
-        return header + inner, "phpkobo (extração experimental)"
+    except Exception:
+        pass
 
-    return None, ""
+    def decode_escapes(s):
+        def repl_x(mo):
+            try:
+                return chr(int(mo.group(1), 16))
+            except Exception:
+                return mo.group(0)
+        s = re.sub(r"\\x([0-9a-fA-F]{2})", repl_x, s)
+        s = re.sub(r"\\u([0-9a-fA-F]{4})", repl_x, s)
+        return s
+
+    inner = decode_escapes(inner)
+
+    header = (
+        "/* ============================================================\n"
+        "   EXTRAÇÃO EXPERIMENTAL (phpkobo / Function packing, regex)\n"
+        "   Só remove a casca — não executa nada. Pode ainda estar cifrado.\n"
+        "   ============================================================ */\n\n"
+    )
+    return header + inner, "phpkobo (extração experimental / regex)"
 
 
 def extract_and_decode(raw: str) -> tuple[str | None, str]:
     """Retorna (resultado, método_usado)"""
 
-    # 0. phpkobo / Function packing PRIMEIRO
-    # (arquivos grandes travam nos regex de unescape/atob se ficarem por último)
-    if (
+    is_phpkobo_like = (
         "phpkobo.com" in raw.lower()
         or "html-obfuscator" in raw.lower()
         or ("Function(" in raw and len(raw) > 8000)
-    ):
-        result, method = try_phpkobo(raw)
+    )
+
+    if is_phpkobo_like:
+        # 1) tenta a sandbox Node primeiro (mais confiável)
+        result, method = try_phpkobo_sandbox(raw)
+        if result:
+            return result, method
+        # 2) cai pro regex se Node não estiver disponível ou falhar
+        result, method = try_phpkobo_regex(raw)
         if result:
             return result, method
 
-    # 1. unescape — versão rápida (sem regex pesado)
     idx = raw.find("unescape(")
     if idx != -1:
         rest = raw[idx + 9:].lstrip()
@@ -141,7 +189,6 @@ def extract_and_decode(raw: str) -> tuple[str | None, str]:
                 except Exception:
                     pass
 
-    # 2. atob — versão rápida
     idx = raw.find("atob(")
     if idx != -1:
         rest = raw[idx + 5:].lstrip()
@@ -153,7 +200,6 @@ def extract_and_decode(raw: str) -> tuple[str | None, str]:
                 if res:
                     return res, "atob() / base64"
 
-    # 3. Tenta como string bruta (percent / base64)
     payload = raw.strip().strip("'\"")
 
     if re.search(r"%[0-9a-fA-F]{2}|%u[0-9a-fA-F]{4}", payload[:5000], re.I):
@@ -167,49 +213,37 @@ def extract_and_decode(raw: str) -> tuple[str | None, str]:
         if res:
             return res, "atob() / base64 (auto)"
 
-    # 4. Última tentativa phpkobo
-    result, method = try_phpkobo(raw)
-    if result:
-        return result, method
-
     return None, ""
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    node_status = "✅ disponível" if node_available() else "⚠️ indisponível (usando fallback regex)"
     await update.message.reply_text(
         "🔓 *Desofuscador de HTML*\n\n"
         "Envie o código ofuscado como *texto* ou como *arquivo* (.txt / .html)\n\n"
         "Formatos suportados:\n"
-        "• `unescape()` / percent-encoding (html-code-generator)\n"
+        "• `unescape()` / percent-encoding\n"
         "• `atob()` / base64\n"
-        "• phpkobo (extração experimental)\n\n"
+        "• phpkobo (sandbox Node ou regex)\n\n"
+        f"Sandbox Node: {node_status}\n\n"
         "Eu devolvo o código + o arquivo `.html` pronto para download.",
         parse_mode="Markdown"
     )
 
 
-async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    raw = update.message.text
-    if not raw or len(raw) < 20:
-        await update.message.reply_text("Envie o código ofuscado completo.")
-        return
-
-    msg = await update.message.reply_text("⏳ Desofuscando...")
-
+async def _process_and_reply(update: Update, msg, raw: str):
     result, method = extract_and_decode(raw)
 
     if not result:
         await msg.edit_text(
-            "❌ Não consegui identificar o formato.\n\n"
-            "Cole o script completo com `unescape(...)` ou `atob(...)`."
+            "❌ Não consegui identificar/desofuscar o formato.\n\n"
+            "Cole o script completo com `unescape(...)`, `atob(...)` ou phpkobo."
         )
         return
 
     await msg.edit_text(f"✅ Decodificado com sucesso!\nMétodo: *{method}*", parse_mode="Markdown")
 
-    # Envia o arquivo .html
     try:
-        # Trata surrogates e caracteres inválidos (erro utf-8)
         clean = result.encode('utf-8', errors='replace').decode('utf-8')
         bio = BytesIO(clean.encode('utf-8'))
         bio.seek(0)
@@ -222,12 +256,25 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"❌ Erro ao enviar o arquivo: {e}")
 
 
+async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    raw = update.message.text
+    if not raw or len(raw) < 20:
+        await update.message.reply_text("Envie o código ofuscado completo.")
+        return
+
+    if len(raw) > MAX_INPUT_SIZE:
+        await update.message.reply_text("❌ Texto muito grande. Envie como arquivo (.txt/.html).")
+        return
+
+    msg = await update.message.reply_text("⏳ Desofuscando...")
+    await _process_and_reply(update, msg, raw)
+
+
 async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     doc = update.message.document
     if not doc:
         return
 
-    # Limite de tamanho (Telegram permite até 20MB, mas vamos limitar)
     if doc.file_size and doc.file_size > 5 * 1024 * 1024:
         await update.message.reply_text("❌ Arquivo muito grande (máximo 5MB).")
         return
@@ -242,27 +289,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await msg.edit_text(f"❌ Erro ao baixar o arquivo: {e}")
         return
 
-    result, method = extract_and_decode(raw)
-
-    if not result:
-        await msg.edit_text("❌ Não consegui desofuscar esse arquivo.")
-        return
-
-    await msg.edit_text(f"✅ Decodificado com sucesso!\nMétodo: *{method}*", parse_mode="Markdown")
-
-    # Envia o arquivo .html
-    try:
-        # Trata surrogates e caracteres inválidos (erro utf-8)
-        clean = result.encode('utf-8', errors='replace').decode('utf-8')
-        bio = BytesIO(clean.encode('utf-8'))
-        bio.seek(0)
-        await update.message.reply_document(
-            document=bio,
-            filename="decodificado.html",
-            caption=f"✅ Arquivo pronto!\nMétodo usado: {method}"
-        )
-    except Exception as e:
-        await update.message.reply_text(f"❌ Erro ao enviar o arquivo: {e}")
+    await _process_and_reply(update, msg, raw)
 
 
 def main():
