@@ -104,13 +104,16 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await msg.edit_text(f"✅ Decodificado com sucesso!\nMétodo: *{method}*", parse_mode="Markdown")
 
     # Envia o arquivo .html
-    bio = BytesIO(result.encode('utf-8'))
-    bio.name = "decodificado.html"
-    await update.message.reply_document(
-        document=bio,
-        filename="decodificado.html",
-        caption=f"✅ Arquivo pronto!\nMétodo usado: {method}"
-    )
+    try:
+        bio = BytesIO(result.encode('utf-8'))
+        bio.seek(0)
+        await update.message.reply_document(
+            document=bio,
+            filename="decodificado.html",
+            caption=f"✅ Arquivo pronto!\nMétodo usado: {method}"
+        )
+    except Exception as e:
+        await update.message.reply_text(f"❌ Erro ao enviar o arquivo: {e}")
 
 
 async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -141,13 +144,17 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await msg.edit_text(f"✅ Decodificado com sucesso!\nMétodo: *{method}*", parse_mode="Markdown")
 
-    bio = BytesIO(result.encode('utf-8'))
-    bio.name = "decodificado.html"
-    await update.message.reply_document(
-        document=bio,
-        filename="decodificado.html",
-        caption=f"✅ Arquivo pronto!\nMétodo usado: {method}"
-    )
+    # Envia o arquivo .html
+    try:
+        bio = BytesIO(result.encode('utf-8'))
+        bio.seek(0)
+        await update.message.reply_document(
+            document=bio,
+            filename="decodificado.html",
+            caption=f"✅ Arquivo pronto!\nMétodo usado: {method}"
+        )
+    except Exception as e:
+        await update.message.reply_text(f"❌ Erro ao enviar o arquivo: {e}")
 
 
 def main():
