@@ -42,6 +42,78 @@ def try_base64(s: str) -> str | None:
         return None
 
 
+def try_phpkobo(raw: str) -> tuple[str | None, str]:
+    """
+    Extração experimental do tipo phpkobo.com/html-obfuscator.
+    Remove a casca do Function("...") e devolve o código interno.
+    Não executa o JS — só extrai o conteúdo.
+    """
+    # Detecta o comentário ou a estrutura típica
+    is_phpkobo = (
+        "phpkobo.com" in raw.lower()
+        or "html-obfuscator" in raw.lower()
+        or (raw.strip().startswith((";Function(", "Function(")) and len(raw) > 5000)
+    )
+
+    if not is_phpkobo:
+        # Também tenta achar Function("...") mesmo sem o comentário
+        if "Function(" not in raw or len(raw) < 3000:
+            return None, ""
+
+    # Remove tags HTML e comentários
+    js = re.sub(r"<!--.*?-->", "", raw, flags=re.DOTALL)
+    js = re.sub(r"<!DOCTYPE[^>]*>", "", js, flags=re.I)
+    js = re.sub(r"<meta[^>]*>", "", js, flags=re.I)
+    js = re.sub(r"</?script[^>]*>", "", js, flags=re.I)
+    js = js.strip()
+
+    # Tenta extrair o argumento de Function("...") ou Function('...')
+    # O argumento costuma ser muito grande e terminar com ")();"
+    m = re.search(
+        r"""Function\s*\(\s*(['"])(.*?)\1\s*\)\s*\(\s*\)""",
+        js,
+        re.DOTALL,
+    )
+    if m:
+        inner = m.group(2)
+        # Desescapa sequências comuns
+        try:
+            inner = (
+                inner.replace("\\\\", "\\")
+                .replace("\\n", "\n")
+                .replace("\\r", "\r")
+                .replace("\\t", "\t")
+                .replace("\\'", "'")
+                .replace('\\"', '"')
+            )
+        except Exception:
+            pass
+
+        # Decodifica \xNN e \uNNNN se existirem
+        def decode_escapes(s):
+            def repl_x(mo):
+                try:
+                    return chr(int(mo.group(1), 16))
+                except Exception:
+                    return mo.group(0)
+            s = re.sub(r"\\x([0-9a-fA-F]{2})", repl_x, s)
+            s = re.sub(r"\\u([0-9a-fA-F]{4})", repl_x, s)
+            return s
+
+        inner = decode_escapes(inner)
+
+        header = (
+            "/* ============================================================\n"
+            "   EXTRAÇÃO EXPERIMENTAL (phpkobo / Function packing)\n"
+            "   O código abaixo ainda pode estar parcialmente ofuscado.\n"
+            "   Não é uma desofuscação completa — apenas remove a casca.\n"
+            "   ============================================================ */\n\n"
+        )
+        return header + inner, "phpkobo (extração experimental)"
+
+    return None, ""
+
+
 def extract_and_decode(raw: str) -> tuple[str | None, str]:
     """Retorna (resultado, método_usado)"""
     # 1. unescape('...') ou unescape("...")
@@ -59,10 +131,10 @@ def extract_and_decode(raw: str) -> tuple[str | None, str]:
         if res:
             return res, "atob() / base64"
 
-    # 3. Tenta como string bruta
+    # 3. Tenta como string bruta (percent / base64)
     payload = raw.strip().strip("'\"")
 
-    if re.search(r'%[0-9a-fA-F]{2}|%u[0-9a-fA-F]{4}', payload, re.I):
+    if re.search(r"%[0-9a-fA-F]{2}|%u[0-9a-fA-F]{4}", payload, re.I):
         try:
             return js_unescape(payload), "unescape() / percent-encoding (auto)"
         except Exception:
@@ -72,6 +144,11 @@ def extract_and_decode(raw: str) -> tuple[str | None, str]:
     if res:
         return res, "atob() / base64 (auto)"
 
+    # 4. Experimental: phpkobo / Function packing
+    result, method = try_phpkobo(raw)
+    if result:
+        return result, method
+
     return None, ""
 
 
@@ -79,7 +156,11 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "🔓 *Desofuscador de HTML*\n\n"
         "Envie o código ofuscado como *texto* ou como *arquivo* (.txt / .html)\n\n"
-        "Eu devolvo o código limpo + o arquivo `.html` pronto para download.",
+        "Formatos suportados:\n"
+        "• `unescape()` / percent-encoding (html-code-generator)\n"
+        "• `atob()` / base64\n"
+        "• phpkobo (extração experimental)\n\n"
+        "Eu devolvo o código + o arquivo `.html` pronto para download.",
         parse_mode="Markdown"
     )
 
