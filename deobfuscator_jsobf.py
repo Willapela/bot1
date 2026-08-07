@@ -2,48 +2,48 @@ import subprocess
 import tempfile
 import os
 import shutil
+import glob
 
 def is_js_obfuscator(code: str) -> bool:
-    """Heurística: detecta o padrão de javascript-obfuscator."""
     if not code or len(code) < 500:
         return False
-    markers = [
-        "_0x",
-        "while (true)", "while(!![])",
-        "['push']", ".push(",
-    ]
+    markers = ["_0x", "while (true)", "while(!![])", "['push']", ".push("]
     hits = sum(1 for m in markers if m in code)
     return hits >= 2 and "_0x" in code
 
 
 def _find_npx() -> str:
-    """Procura o npx em vários lugares comuns."""
     # 1) PATH normal
     path = shutil.which("npx")
     if path:
         return path
 
-    # 2) Caminhos comuns no Linux / Railway / Nixpacks
+    # 2) Caminhos fixos comuns
     candidates = [
         "/usr/bin/npx",
         "/usr/local/bin/npx",
-        "/root/.nvm/versions/node/current/bin/npx",
-        "/home/railway/.nvm/versions/node/current/bin/npx",
+        "/bin/npx",
     ]
+
+    # 3) Nix store (Railway/Nixpacks)
+    candidates += glob.glob("/nix/store/*nodejs*/bin/npx")
+    candidates += glob.glob("/nix/store/*-nodejs-*/bin/npx")
+
     for c in candidates:
         if os.path.isfile(c) and os.access(c, os.X_OK):
             return c
 
+    # 4) Debug: lista o que existe
+    debug = []
+    debug.append(f"PATH={os.environ.get('PATH', '')}")
+    debug.append(f"which(npx)={shutil.which('npx')}")
+    debug.append(f"which(node)={shutil.which('node')}")
     raise FileNotFoundError(
-        "npx não encontrado. Instale Node.js no build do Railway "
-        "(adicione nodejs no nixpacks.toml ou no Dockerfile)."
+        "npx não encontrado. " + " | ".join(debug)
     )
 
 
-def deobfuscate_js_obfuscator(code: str, timeout: int = 60) -> str:
-    """
-    Usa o webcrack (via npx) para reverter ofuscação do tipo javascript-obfuscator.
-    """
+def deobfuscate_js_obfuscator(code: str, timeout: int = 90) -> str:
     npx = _find_npx()
 
     with tempfile.TemporaryDirectory() as tmp:
@@ -54,7 +54,6 @@ def deobfuscate_js_obfuscator(code: str, timeout: int = 60) -> str:
         with open(in_path, "w", encoding="utf-8") as f:
             f.write(code)
 
-        # Garante que o PATH do subprocess tenha o diretório do npx
         env = os.environ.copy()
         npx_dir = os.path.dirname(npx)
         env["PATH"] = npx_dir + os.pathsep + env.get("PATH", "")
