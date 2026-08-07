@@ -1,4 +1,4 @@
-# nixpacks.toml
+providers = ["python", "node"]
 
 [phases.setup]
 nixPkgs = ["python311", "nodejs_20"]
