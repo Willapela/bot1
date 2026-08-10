@@ -1,9 +1,6 @@
 /**
  * deobfuscate.js
- * Roda o loader phpkobo em sandbox, permite Function/eval executarem,
- * e captura document.write / insertRule (HTML final).
- *
- * Saída JSON: array de { type, value }
+ * Sandbox vm com Function/eval DENTRO do contexto + captura document.write
  */
 
 const vm = require("vm");
@@ -26,8 +23,10 @@ function extractScriptBody(raw) {
 async function main() {
   const raw = await readStdin();
   const code = extractScriptBody(raw);
-
   const captured = [];
+
+  // context será preenchido depois
+  let context = null;
 
   const document = {
     characterSet: "UTF-8",
@@ -71,6 +70,49 @@ async function main() {
     }
   }
 
+  function sandboxedFunction(...args) {
+    const body = args[args.length - 1];
+    const params = args.slice(0, -1).map(String);
+
+    if (typeof body === "string" && body.length > 50) {
+      captured.push({ type: "Function()", value: body });
+    }
+
+    // Retorna função que executa o body DENTRO do contexto vm
+    return function (...callArgs) {
+      if (!context) return undefined;
+      try {
+        const paramList = params.join(",");
+        const wrapper =
+          "(function(" + paramList + "){\n" + String(body) + "\n})";
+        const fn = vm.runInContext(wrapper, context, { timeout: 8000 });
+        return fn.apply(this, callArgs);
+      } catch (e) {
+        captured.push({
+          type: "error",
+          value: "Function exec: " + (e && e.message ? e.message : String(e)),
+        });
+        return undefined;
+      }
+    };
+  }
+
+  function sandboxedEval(src) {
+    if (typeof src === "string" && src.length > 50) {
+      captured.push({ type: "eval()", value: src });
+    }
+    if (!context) return undefined;
+    try {
+      return vm.runInContext(String(src), context, { timeout: 8000 });
+    } catch (e) {
+      captured.push({
+        type: "error",
+        value: "eval: " + (e && e.message ? e.message : String(e)),
+      });
+      return undefined;
+    }
+  }
+
   const windowObj = {
     document,
     console: {
@@ -90,7 +132,12 @@ async function main() {
     addEventListener() {},
     removeEventListener() {},
     CSSStyleSheet,
-    fetch: () => Promise.resolve({ ok: false, text: async () => "", json: async () => ({}) }),
+    fetch: () =>
+      Promise.resolve({
+        ok: false,
+        text: async () => "",
+        json: async () => ({}),
+      }),
     XMLHttpRequest: function () {
       this.open = () => {};
       this.send = () => {};
@@ -99,31 +146,32 @@ async function main() {
     },
     atob: (s) => Buffer.from(String(s), "base64").toString("binary"),
     btoa: (s) => Buffer.from(String(s), "binary").toString("base64"),
-    parseInt, parseFloat, isNaN, String, Number, Array, Object, Math, JSON, Date,
-    RegExp, Error, TypeError, ReferenceError,
-    encodeURIComponent, decodeURIComponent, escape, unescape,
+    parseInt,
+    parseFloat,
+    isNaN,
+    String,
+    Number,
+    Array,
+    Object,
+    Math,
+    JSON,
+    Date,
+    RegExp,
+    Error,
+    TypeError,
+    ReferenceError,
+    encodeURIComponent,
+    decodeURIComponent,
+    escape,
+    unescape,
+    Function: sandboxedFunction,
+    eval: sandboxedEval,
   };
 
   windowObj.window = windowObj;
   windowObj.self = windowObj;
   windowObj.globalThis = windowObj;
   windowObj.document.defaultView = windowObj;
-
-  // Function REAL + registra body
-  windowObj.Function = function (...args) {
-    const body = args[args.length - 1];
-    if (typeof body === "string" && body.length > 50) {
-      captured.push({ type: "Function()", value: body });
-    }
-    return Function.prototype.constructor.apply(null, args);
-  };
-
-  windowObj.eval = function (src) {
-    if (typeof src === "string" && src.length > 50) {
-      captured.push({ type: "eval()", value: src });
-    }
-    return eval(src);
-  };
 
   const sandbox = {
     window: windowObj,
@@ -133,8 +181,8 @@ async function main() {
     console: windowObj.console,
     navigator: windowObj.navigator,
     location: windowObj.location,
-    Function: windowObj.Function,
-    eval: windowObj.eval,
+    Function: sandboxedFunction,
+    eval: sandboxedEval,
     setTimeout: windowObj.setTimeout,
     setInterval: windowObj.setInterval,
     clearTimeout: windowObj.clearTimeout,
@@ -144,16 +192,31 @@ async function main() {
     XMLHttpRequest: windowObj.XMLHttpRequest,
     atob: windowObj.atob,
     btoa: windowObj.btoa,
-    parseInt, parseFloat, isNaN, String, Number, Array, Object, Math, JSON, Date,
-    RegExp, Error, TypeError, ReferenceError,
-    encodeURIComponent, decodeURIComponent, escape, unescape,
+    parseInt,
+    parseFloat,
+    isNaN,
+    String,
+    Number,
+    Array,
+    Object,
+    Math,
+    JSON,
+    Date,
+    RegExp,
+    Error,
+    TypeError,
+    ReferenceError,
+    encodeURIComponent,
+    decodeURIComponent,
+    escape,
+    unescape,
   };
 
-  const context = vm.createContext(sandbox);
+  context = vm.createContext(sandbox);
 
   try {
     vm.runInContext(code, context, {
-      timeout: 12000,
+      timeout: 15000,
       microtaskMode: "afterEvaluate",
     });
   } catch (err) {
