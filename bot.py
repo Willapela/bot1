@@ -206,16 +206,75 @@ def try_phpkobo_sandbox(raw: str) -> tuple[str | None, str]:
     return header + best, "phpkobo (sandbox Node)"
 
 
-def try_phpkobo_regex(raw: str) -> tuple[str | None, str]:
-    is_phpkobo = (
-        "phpkobo.com" in raw.lower()
-        or "html-obfuscator" in raw.lower()
-        or (raw.strip().startswith((";Function(", "Function(")) and len(raw) > 5000)
-    )
-    if not is_phpkobo:
-        if "Function(" not in raw or len(raw) < 3000:
-            return None, ""
+def try_phpkobo_sandbox(raw: str) -> tuple[str | None, str]:
+    if not node_available():
+        return None, ""
 
+    if len(raw) > MAX_INPUT_SIZE:
+        return None, "arquivo excede o limite de processamento seguro"
+
+    try:
+        proc = subprocess.run(
+            ["node", NODE_SCRIPT],
+            input=raw,
+            capture_output=True,
+            text=True,
+            timeout=15,  # um pouco mais, porque agora executa de verdade
+        )
+    except subprocess.TimeoutExpired:
+        return None, "timeout ao executar sandbox"
+    except Exception as e:
+        return None, f"erro ao chamar sandbox: {e}"
+
+    if proc.returncode != 0 or not proc.stdout:
+        return None, ""
+
+    try:
+        captured = json.loads(proc.stdout)
+    except Exception:
+        return None, ""
+
+    # 1) Prioridade: document.write = HTML final
+    writes = [c["value"] for c in captured if c.get("type") == "document.write" and c.get("value")]
+    if writes:
+        best = max(writes, key=len)
+        if len(best.strip()) > 20:
+            header = (
+                "/* ============================================================\n"
+                "   DESOFUSCAÇÃO PHPKOBO (sandbox + document.write)\n"
+                "   ============================================================ */\n\n"
+            )
+            return header + best, "phpkobo (sandbox + document.write)"
+
+    # 2) CSS
+    rules = [c["value"] for c in captured if c.get("type") == "insertRule" and c.get("value")]
+    if rules:
+        css = "\n".join(rules)
+        header = (
+            "/* ============================================================\n"
+            "   DESOFUSCAÇÃO PHPKOBO (CSS insertRule)\n"
+            "   ============================================================ */\n\n"
+        )
+        return header + "<style>\n" + css + "\n</style>", "phpkobo (sandbox + insertRule)"
+
+    # 3) Fallback: Function/eval capturados → tenta unified
+    candidates = [c["value"] for c in captured if c.get("type") in ("Function()", "eval()") and c.get("value")]
+    if candidates:
+        best = max(candidates, key=len)
+        if phpkobo_unified_available() and len(best) > 200:
+            further, _ = try_phpkobo_unified(best)
+            if further and len(further) > 100:
+                return further, "phpkobo (sandbox → unified)"
+
+        header = (
+            "/* ============================================================\n"
+            "   DESOFUSCAÇÃO VIA SANDBOX (camada intermediária)\n"
+            "   ============================================================ */\n\n"
+        )
+        return header + best, "phpkobo (sandbox Node)"
+
+    return None, ""
+    
     js = re.sub(r"<!--.*?-->", "", raw, flags=re.DOTALL)
     js = re.sub(r"<!DOCTYPE[^>]*>", "", js, flags=re.I)
     js = re.sub(r"<meta[^>]*>", "", js, flags=re.I)
