@@ -25,7 +25,6 @@ async function main() {
   const code = extractScriptBody(raw);
   const captured = [];
 
-  // context será preenchido depois
   let context = null;
 
   const document = {
@@ -70,7 +69,7 @@ async function main() {
     }
   }
 
-  Function.prototype.constructor.apply
+  function sandboxedFunction(...args) {
     const body = args[args.length - 1];
     const params = args.slice(0, -1).map(String);
 
@@ -78,7 +77,6 @@ async function main() {
       captured.push({ type: "Function()", value: body });
     }
 
-    // Retorna função que executa o body DENTRO do contexto vm
     return function (...callArgs) {
       if (!context) return undefined;
       try {
