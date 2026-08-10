@@ -26,6 +26,7 @@ except ImportError:
 TOKEN = os.environ.get("TOKEN")
 
 NODE_SCRIPT = os.path.join(os.path.dirname(__file__), "deobfuscate.js")
+PHPKOBO_UNIFIED = os.path.join(os.path.dirname(__file__), "phpkobo_unified.js")
 
 MAX_INPUT_SIZE = 2_000_000
 NODE_TIMEOUT_SECONDS = 8
@@ -108,6 +109,65 @@ def try_base64(s: str) -> str | None:
 
 def node_available() -> bool:
     return shutil.which("node") is not None and os.path.exists(NODE_SCRIPT)
+
+
+def phpkobo_unified_available() -> bool:
+    return shutil.which("node") is not None and os.path.exists(PHPKOBO_UNIFIED)
+
+
+def try_phpkobo_unified(raw: str) -> tuple[str | None, str]:
+    """
+    Desofuscador unificado (hook document.write / insertRule)
+    baseado no UnbuiltAlmond8/PHPKoboDeobfuscator.
+    """
+    if not phpkobo_unified_available():
+        return None, ""
+
+    low = raw.lower()
+    looks_like = (
+        "phpkobo" in low
+        or "html-obfuscator" in low
+        or ("function(" in low and len(raw) > 2000)
+        or "document.write" in low
+    )
+    if not looks_like:
+        return None, ""
+
+    if len(raw) > MAX_INPUT_SIZE:
+        return None, "arquivo excede o limite de processamento seguro"
+
+    try:
+        proc = subprocess.run(
+            ["node", PHPKOBO_UNIFIED],
+            input=raw,
+            capture_output=True,
+            text=True,
+            timeout=20,
+        )
+    except subprocess.TimeoutExpired:
+        return None, "timeout no phpkobo unified"
+    except Exception as e:
+        return None, f"erro ao chamar phpkobo unified: {e}"
+
+    if proc.returncode != 0 or not proc.stdout:
+        return None, ""
+
+    try:
+        data = json.loads(proc.stdout)
+    except Exception:
+        return None, ""
+
+    if not data.get("ok") or not data.get("html"):
+        return None, data.get("error") or ""
+
+    header = (
+        "/* ============================================================\n"
+        "   DESOFUSCAÇÃO PHPKOBO (unified / document.write hook)\n"
+        f"   Método: {data.get('method', 'phpkobo-unified')}\n"
+        "   Baseado em: UnbuiltAlmond8/PHPKoboDeobfuscator\n"
+        "   ============================================================ */\n\n"
+    )
+    return header + data["html"], data.get("method", "phpkobo-unified")
 
 
 def try_phpkobo_sandbox(raw: str) -> tuple[str | None, str]:
@@ -238,7 +298,6 @@ def extract_and_decode(raw: str) -> tuple[str | None, str, str]:
             )
             return header + pure_js, "javascript-obfuscator (extraído, ainda ofuscado)", "js"
 
-        # Módulo retornou vazio → devolve o puro
         header = (
             "/* ============================================================\n"
             "   JAVASCRIPT-OBFUSCATOR DETECTADO\n"
@@ -247,7 +306,12 @@ def extract_and_decode(raw: str) -> tuple[str | None, str, str]:
         )
         return header + pure_js, "javascript-obfuscator (extraído, ainda ofuscado)", "js"
 
-    # 2) phpkobo / Function packing
+    # 2) PHPKOBO UNIFICADO (novo – document.write hook)
+    result, method = try_phpkobo_unified(raw)
+    if result:
+        return result, method, "html"
+
+    # 3) phpkobo sandbox / regex
     is_phpkobo_like = (
         "phpkobo.com" in raw.lower()
         or "html-obfuscator" in raw.lower()
@@ -263,7 +327,7 @@ def extract_and_decode(raw: str) -> tuple[str | None, str, str]:
         if result:
             return result, method, "html"
 
-    # 3) unescape() / percent-encoding
+    # 4) unescape() / percent-encoding
     idx = raw.find("unescape(")
     if idx != -1:
         rest = raw[idx + 9:].lstrip()
@@ -276,7 +340,7 @@ def extract_and_decode(raw: str) -> tuple[str | None, str, str]:
                 except Exception:
                     pass
 
-    # 4) atob() / base64
+    # 5) atob() / base64
     idx = raw.find("atob(")
     if idx != -1:
         rest = raw[idx + 5:].lstrip()
@@ -288,7 +352,7 @@ def extract_and_decode(raw: str) -> tuple[str | None, str, str]:
                 if res:
                     return res, "atob() / base64", "html"
 
-    # 5) Detecção automática
+    # 6) Detecção automática
     payload = raw.strip().strip("'\"")
 
     if re.search(r"%[0-9a-fA-F]{2}|%u[0-9a-fA-F]{4}", payload[:5000], re.I):
@@ -312,6 +376,7 @@ def extract_and_decode(raw: str) -> tuple[str | None, str, str]:
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     node_status = "✅ disponível" if node_available() else "⚠️ indisponível (usando fallback regex)"
     js_obf_status = "✅ disponível" if HAS_JS_OBF_MODULE else "⚠️ módulo não encontrado"
+    unified_status = "✅ disponível" if phpkobo_unified_available() else "⚠️ phpkobo_unified.js não encontrado"
 
     await update.message.reply_text(
         "🔓 *Desofuscador de HTML / JS*\n\n"
@@ -319,10 +384,11 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Formatos suportados:\n"
         "• `unescape()` / percent-encoding\n"
         "• `atob()` / base64\n"
-        "• phpkobo (sandbox Node ou regex)\n"
+        "• phpkobo (unified / sandbox / regex)\n"
         "• **javascript-obfuscator**\n\n"
         f"Sandbox Node: {node_status}\n"
-        f"JS-Obfuscator: {js_obf_status}\n\n"
+        f"JS-Obfuscator: {js_obf_status}\n"
+        f"PHPKOBO Unified: {unified_status}\n\n"
         "Eu devolvo o código + o arquivo pronto para download.",
         parse_mode="Markdown"
     )
@@ -333,6 +399,11 @@ async def _process_and_reply(update: Update, msg, raw: str):
         await msg.edit_text(
             "🔍 Detectado padrão **javascript-obfuscator**...\n"
             "Processando (pode levar alguns segundos)..."
+        )
+    elif "phpkobo" in raw.lower() or ("Function(" in raw and len(raw) > 3000):
+        await msg.edit_text(
+            "🔍 Detectado padrão **phpkobo**...\n"
+            "Processando (unified → sandbox → regex)..."
         )
 
     result, method, extension = extract_and_decode(raw)
@@ -414,8 +485,9 @@ def main():
     app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
 
     print("🤖 Bot desofuscador rodando...")
-    print(f"   JS-Obfuscator: {'✅' if HAS_JS_OBF_MODULE else '❌ módulo não encontrado'}")
-    print(f"   Node sandbox:  {'✅' if node_available() else '❌'}")
+    print(f"   JS-Obfuscator:     {'✅' if HAS_JS_OBF_MODULE else '❌ módulo não encontrado'}")
+    print(f"   Node sandbox:      {'✅' if node_available() else '❌'}")
+    print(f"   PHPKOBO Unified:   {'✅' if phpkobo_unified_available() else '❌'}")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
