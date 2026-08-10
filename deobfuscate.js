@@ -70,7 +70,7 @@ async function main() {
     }
   }
 
-  function sandboxedFunction(...args) {
+  Function.prototype.constructor.apply
     const body = args[args.length - 1];
     const params = args.slice(0, -1).map(String);
 
