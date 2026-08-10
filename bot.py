@@ -29,7 +29,7 @@ NODE_SCRIPT = os.path.join(os.path.dirname(__file__), "deobfuscate.js")
 PHPKOBO_UNIFIED = os.path.join(os.path.dirname(__file__), "phpkobo_unified.js")
 
 MAX_INPUT_SIZE = 2_000_000
-NODE_TIMEOUT_SECONDS = 8
+NODE_TIMEOUT_SECONDS = 15
 
 
 # =====================================================================
@@ -173,55 +173,6 @@ def try_phpkobo_sandbox(raw: str) -> tuple[str | None, str]:
             timeout=NODE_TIMEOUT_SECONDS,
         )
     except subprocess.TimeoutExpired:
-        return None, "timeout ao executar sandbox (arquivo muito complexo)"
-    except Exception as e:
-        return None, f"erro ao chamar sandbox: {e}"
-
-    if proc.returncode != 0 or not proc.stdout:
-        return None, ""
-
-    try:
-        captured = json.loads(proc.stdout)
-    except Exception:
-        return None, ""
-
-    candidates = [c["value"] for c in captured if c["type"] in ("Function()", "eval()")]
-    if not candidates:
-        return None, ""
-
-    best = max(candidates, key=len)
-
-    # Encadeia: camada do sandbox → unified (document.write)
-    if phpkobo_unified_available() and len(best) > 200:
-        further, method2 = try_phpkobo_unified(best)
-        if further and len(further) > 100:
-            return further, "phpkobo (sandbox → unified)"
-
-    header = (
-        "/* ============================================================\n"
-        "   DESOFUSCAÇÃO VIA SANDBOX (Node vm, Function/eval interceptados)\n"
-        "   O código abaixo foi capturado antes de ser executado de fato.\n"
-        "   ============================================================ */\n\n"
-    )
-    return header + best, "phpkobo (sandbox Node)"
-
-
-def try_phpkobo_sandbox(raw: str) -> tuple[str | None, str]:
-    if not node_available():
-        return None, ""
-
-    if len(raw) > MAX_INPUT_SIZE:
-        return None, "arquivo excede o limite de processamento seguro"
-
-    try:
-        proc = subprocess.run(
-            ["node", NODE_SCRIPT],
-            input=raw,
-            capture_output=True,
-            text=True,
-            timeout=15,  # um pouco mais, porque agora executa de verdade
-        )
-    except subprocess.TimeoutExpired:
         return None, "timeout ao executar sandbox"
     except Exception as e:
         return None, f"erro ao chamar sandbox: {e}"
@@ -257,8 +208,11 @@ def try_phpkobo_sandbox(raw: str) -> tuple[str | None, str]:
         )
         return header + "<style>\n" + css + "\n</style>", "phpkobo (sandbox + insertRule)"
 
-    # 3) Fallback: Function/eval capturados → tenta unified
-    candidates = [c["value"] for c in captured if c.get("type") in ("Function()", "eval()") and c.get("value")]
+    # 3) Fallback: Function/eval → unified
+    candidates = [
+        c["value"] for c in captured
+        if c.get("type") in ("Function()", "eval()") and c.get("value")
+    ]
     if candidates:
         best = max(candidates, key=len)
         if phpkobo_unified_available() and len(best) > 200:
@@ -274,7 +228,18 @@ def try_phpkobo_sandbox(raw: str) -> tuple[str | None, str]:
         return header + best, "phpkobo (sandbox Node)"
 
     return None, ""
-    
+
+
+def try_phpkobo_regex(raw: str) -> tuple[str | None, str]:
+    is_phpkobo = (
+        "phpkobo.com" in raw.lower()
+        or "html-obfuscator" in raw.lower()
+        or (raw.strip().startswith((";Function(", "Function(")) and len(raw) > 5000)
+    )
+    if not is_phpkobo:
+        if "Function(" not in raw or len(raw) < 3000:
+            return None, ""
+
     js = re.sub(r"<!--.*?-->", "", raw, flags=re.DOTALL)
     js = re.sub(r"<!DOCTYPE[^>]*>", "", js, flags=re.I)
     js = re.sub(r"<meta[^>]*>", "", js, flags=re.I)
@@ -360,7 +325,7 @@ def extract_and_decode(raw: str) -> tuple[str | None, str, str]:
     if result:
         return result, method, "html"
 
-    # 3) sandbox (encadeia → unified) + regex
+    # 3) sandbox + regex
     is_phpkobo_like = (
         "phpkobo.com" in raw.lower()
         or "html-obfuscator" in raw.lower()
